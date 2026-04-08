@@ -8,28 +8,26 @@
 
 ## Files Reviewed
 
-| File | Lines | Verdict | Notes |
-|------|-------|---------|-------|
-| `automation_multifailure.py` | 16 | CI fixture | Not dead — imported by 3 workflow tests |
-| `cash_policy.py` | 17 | Keep | `CashPolicy` dataclass; canonical definition |
-| `_autofix_probe.py` | 18 | CI fixture | Intentional probe for autofix pipeline |
-| `_typing.py` | 19 | Keep | NumPy array type aliases; used in 4 src files |
-| `constants.py` | 22 | Keep | Widely used (11 import sites) |
-| `regime_utils.py` | 25 | Keep | Used by `pipeline_helpers.py` and `monte_carlo/runner.py` |
-| `typing.py` | 34 | Issue (see below) | Exports `MultiPeriodPeriodResult`; unused in production |
-| `_ci_probe_faults.py` | 36 | CI fixture | Style probe; has dedicated test |
-| `_autofix_trigger_sample.py` | 39 | CI fixture | Intentional style violations for autofix |
-| `_autofix_violation_case2.py` | 57 | CI fixture | Intentional violations for autofix |
-| `_autofix_violation_case3.py` | 46 | CI fixture | Intentional violations for autofix |
-| `rebalancing.py` | 58 | Keep (shim) | Backward-compat re-export from `rebalancing/strategies.py` |
-| `script_logging.py` | 60 | Keep | Wraps `logging_setup.py`; used by 30+ scripts |
-| `selector.py` | 69 | Keep | Plugin-registered selectors; used lazily by `multi_period/engine.py` |
-| `run_multi_analysis.py` | 78 | Likely dead | See below |
-| `logging_setup.py` | 99 | Keep | Root logger + file handler setup; 7 src imports |
-| `timefreq.py` | 106 | Keep | Pandas freq aliases + helpers; used by 5 src files |
-| `run_analysis.py` | 137 | Dead | See below |
-| `signal_presets.py` | 144 | Keep | Preset TrendSpecs; used by both CLIs + tests |
-| `universe_catalog.py` | 169 | Keep | Named universe YAML loader; used by both CLIs |
+- `automation_multifailure.py` — CI fixture with a single `aggregate_numbers()` function; exists so the autofix pipeline has a stable, importable target to run against. Imported directly by workflow tests.
+- `cash_policy.py` — Defines the `CashPolicy` dataclass used to configure how implicit cash is handled in rebalancing outputs. Canonical definition; re-exported via the `rebalancing.py` shim.
+- `_autofix_probe.py` — Deliberate autofix probe; originally had a missing import so the CI pipeline had something deterministic to repair. Now clean but kept as a callable fixture.
+- `_typing.py` — Shorthand NumPy array type aliases (`FloatArray`, `VectorF`, `MatrixF`, `AnyArray`) used across numerical computation modules to avoid verbose `np.ndarray[...]` annotations.
+- `constants.py` — Central store for package-wide magic values: default output directory, default export formats, and three numerical tolerance levels. Used in 11 places across src.
+- `regime_utils.py` — Two small helpers for normalising regime key strings (`normalize_regime_key`) and resolving their aliases between calm/stress and riskon/riskoff naming conventions.
+- `typing.py` — Defines a `MultiPeriodPeriodResult` TypedDict and two supporting aliases (`CovarianceDiagonal`, `StatsMapping`) describing the intended shape of multi-period engine results. See issue below — unused in production.
+- `_ci_probe_faults.py` — Style-only CI probe; exercises the yaml and math import paths with three trivial functions. Currently clean; validates that the autofix pipeline produces a passing run.
+- `_autofix_trigger_sample.py` — Intentionally badly formatted code (spacing, long lines, indentation) so black and ruff have a deterministic target to reformat during CI.
+- `_autofix_violation_case2.py` — Longer set of deliberate violations targeting docformatter, black, and isort specifically; includes an excessively long string and verbose docstrings.
+- `_autofix_violation_case3.py` — Deliberate violations targeting ruff's F841 (unused variable) rule and old-style `List[int]` annotations; comments document which violations are fixable vs. not.
+- `rebalancing.py` — Backward-compatibility shim that re-exports everything from `rebalancing/strategies.py` so legacy imports of `trend_analysis.rebalancing` continue to work without touching the canonical implementations.
+- `script_logging.py` — Thin wrapper around `logging_setup.py` that initialises the perf logger for standalone scripts. Used by 30+ scripts via `setup_script_logging()` and `run_with_script_logging()`.
+- `selector.py` — Registers `RankSelector` and `ZScoreSelector` into the plugin system. `RankSelector` picks top-N funds by a metric column; `ZScoreSelector` filters by z-score threshold. Used lazily by `multi_period/engine.py`.
+- `run_multi_analysis.py` — Standalone argparse CLI entry point for multi-period analysis. Lazily registered in `__init__.py` but never imported or called by any production code. See issue below.
+- `logging_setup.py` — Configures the root Python logger with a timestamped file handler and optional console handler. Returns the log file path. Used by both CLIs and several submodules.
+- `timefreq.py` — Centralises pandas frequency aliases (`ME`, `M`, `QE`, `Q`) and provides `monthly_date_range` / `monthly_period_range` wrappers to enforce the project's datetime frequency policy and avoid FutureWarnings.
+- `run_analysis.py` — Standalone argparse CLI entry point for single-period analysis. Not wired as an entry point in `pyproject.toml`, not imported anywhere. See issue below.
+- `signal_presets.py` — Defines three named `TrendSpec` presets (Conservative, Balanced, Aggressive) and lookup helpers used by both CLIs and the Streamlit UI to populate dropdowns and form defaults.
+- `universe_catalog.py` — Loads named universe definitions from YAML files in `config/universe/`, resolving relative paths for data and membership CSVs, and builds a filtered membership mask via `build_membership_mask`.
 
 ---
 
