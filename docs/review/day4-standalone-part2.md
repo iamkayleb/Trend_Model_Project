@@ -1,111 +1,152 @@
 # Day 4 Review: src/trend_analysis/ root standalone files (Part 2)
 
-**Scope:** Remaining 19 files by line count (172–773 lines each), total ~6,500 lines
-**Date:** 2026-04-20
+**Scope:** Remaining 19 files by line count (172–773 lines each), total ~6,800 lines
+**Date:** 2026-04-20 (revised)
 **Reviewer:** Claude
+
+> **Note:** This document replaces a previous draft that contained several factual errors (misidentified test patch targets, incorrect claim of a Click CLI, overstated severity of a redundant assignment). All claims below have been verified against the source.
 
 ---
 
 ## Files Reviewed
 
-- `weighting.py` — Defines `BaseWeighting` ABC and four concrete strategies: `EqualWeight`, `ScorePropSimple`, `ScorePropBayesian`, `AdaptiveBayesWeighting`. The adaptive strategy is stateful with exponential decay and `get_state`/`set_state` for serialization across pipeline runs.
-- `diagnostics.py` — Imports `DiagnosticPayload`, `DiagnosticResult`, `RunPayload`, `RunPayloadResult` from `trend.diagnostics` and adds `PipelineResult` (dict-like dataclass), `PipelineReasonCode` enum (9 codes), and three coercion helpers. Used by `pipeline_runner.py` to wrap execution results.
+- `weighting.py` — Defines `BaseWeighting` ABC and four concrete strategies: `EqualWeight`, `ScorePropSimple`, `ScorePropBayesian`, `AdaptiveBayesWeighting`. The adaptive strategy is stateful with exponential decay and `get_state`/`set_state` for cross-run serialization.
+- `diagnostics.py` — Re-exports `DiagnosticPayload`, `DiagnosticResult`, `RunPayload`, `RunPayloadResult` from `trend.diagnostics` and adds `PipelineResult` (dict-like dataclass), `PipelineReasonCode` enum (9 codes), and `pipeline_success` / `pipeline_failure` / `coerce_pipeline_result` helpers. Used by `pipeline_runner.py` to wrap execution results.
 - `schedules.py` — Provides `get_rebalance_dates`, `normalize_positions`, and `apply_rebalance_schedule`. Handles frequency string aliases (`"monthly"`, `"weekly"`), timezone alignment, and custom rebalance calendars. Distinct from the `rebalancing.py` compat shim.
-- `signals.py` — Core signal computation: `TrendSpec` frozen dataclass (kind, window, min_periods, lag, vol_adjust, vol_target, zscore) plus `compute_trend_signals()`. Vectorized, strictly causal rolling signal with memoization via a `_FrameHandle` sentinel. Single-responsibility, no issues.
-- `time_utils.py` — `align_calendar()` aligns a DataFrame's Date column to a business-day/weekly/monthly calendar with US holiday generation and timezone handling. Exports only `align_calendar`. Used by the pipeline to normalise dates before signal computation.
-- `pipeline_runner.py` — Contains `_run_analysis_with_diagnostics()` (the real implementation returning a `PipelineResult`) and `_run_analysis()` (a one-liner backward-compat wrapper that calls `_run_analysis_with_diagnostics` and unwraps the result). See issue below.
-- `pipeline_entrypoints.py` — `ConfigBindings` dataclass plus `run_from_config()` and `run_full_from_config()`. These two functions bridge Pydantic config objects to `pipeline.run()` and `pipeline.run_full()`. See issues below.
-- `universe.py` — `MembershipWindow`, `MembershipTable`, `load_universe_membership`, `apply_membership_windows`, `build_membership_mask`, `gate_universe`. `_expand_active_pairs` uses numpy broadcasting for efficient date × membership activity computation. Used by `universe_catalog.py`.
-- `risk.py` — Stateless functions: `compute_constrained_weights`, `realised_volatility`. Handles vol targeting, turnover caps, EWMA vs simple rolling vol, group caps, max active positions. Delegates constraint optimisation to `engine.optimizer`.
-- `tool_layer.py` — `ToolLayer` dataclass with `apply_patch`, `validate_config`, `preview_diff`, `run_analysis` methods. Includes rate limiting, path sandboxing, and JSONL logging of all tool calls. Only imported by `src/trend_analysis/api_server/__init__.py`.
-- `walk_forward.py` — Self-contained parameter sweep engine: YAML config → grid search → fold evaluation → CSV/JSONL/PNG output. Uses `annual_return`, `sharpe_ratio`, `max_drawdown` from `trend_analysis.metrics`. See issue below regarding a second walk-forward implementation in `engine/`.
-- `presets.py` — YAML-driven preset registry (`lru_cache`-backed) that loads `TrendPreset` objects from `config/presets/*.yml`. Provides `form_defaults()`, `signals_mapping()`, `vol_adjust_defaults()`, `metrics_pipeline()`, plus `UI_METRIC_ALIASES` and `PIPELINE_METRIC_ALIASES` mappings. See issue below regarding the parallel `signal_presets.py`.
-- `pipeline.py` — Integration hub: imports from stages, `pipeline_runner`, `pipeline_helpers`, and wires them together. Exports `run()`, `run_full()`, `run_analysis()`, `compute_signal()`, `position_from_signal()`. Contains the `_sync_stage_dependencies()` monkeypatching pattern. See issue below.
-- `regimes.py` — `RegimeSettings`, `compute_regimes`, `aggregate_performance_by_regime`, `build_regime_payload`. Two detection methods: `rolling_return` and `volatility`. Integrates with the perf cache via `_compute_regime_series`. Well-structured single responsibility.
-- `data.py` — `load_csv`, `load_parquet`, `validate_dataframe`, `identify_risk_free_fund`, `ensure_datetime`, `compute_inception_dates`. Central data ingestion layer. See issue below regarding duplication between `load_csv` and `load_parquet`.
-- `api.py` — Main public API: `run_simulation(config, returns) -> RunResult`. `RunResult` dataclass wraps metrics, weights, exposures, turnover, costs, portfolio series, and multi-period period results. Detects `config.multi_period` and delegates to `_run_multi_period_simulation()`. Complex but coherent; no structural issues.
-- `pipeline_helpers.py` — Hub of config-resolution helpers (`_cfg_value`, `_cfg_section`, `_section_get`, etc.), trend spec construction (`_build_trend_spec`), regime override application, and turnover cap parsing. Also contains `compute_signal()` and `position_from_signal()` — placement slightly odd (signal utilities inside a helpers file) but not harmful.
-- `universe.py` — (see entry above; same file as listed at position 8)
+- `signals.py` — Core signal computation: `TrendSpec` frozen dataclass and `compute_trend_signals()`. Vectorized, strictly causal rolling signal with memoization via a `_FrameHandle` sentinel. Debug timing via the `_timed_stage` context manager.
+- `time_utils.py` — `align_calendar()` aligns a DataFrame's Date column to a business-day/weekly/monthly calendar with US holiday generation (`_simple_us_holidays`), timezone handling, and frequency inference. Exports only `align_calendar`.
+- `logging.py` — JSONL structured run logger (separate from `logging_setup.py`): `JsonlHandler`, `init_run_logger`, `log_step`, `iter_jsonl`, `latest_errors`, `logfile_to_frame`, `error_summary`. Includes a simple single-backup rotation strategy.
+- `pipeline_runner.py` — Contains `_run_analysis_with_diagnostics()` (the real implementation) and `_run_analysis()` (its bare-payload wrapper, used as a test monkeypatch target — see issue below).
+- `pipeline_entrypoints.py` — `ConfigBindings` dataclass plus `run_from_config()` and `run_full_from_config()`. Bridges Pydantic config objects to `pipeline.run()` / `pipeline.run_full()`. See issues below.
+- `__init__.py` — Package bootstrap: dataclass module-guard patch, optional `MPLCONFIGDIR` configuration, `_SpecProxy` for spec resilience, eager + lazy submodule registration, version discovery via `importlib.metadata`. Also holds the authoritative `__all__`.
+- `universe.py` — `MembershipWindow`, `MembershipTable`, `load_universe_membership`, `apply_membership_windows`, `build_membership_mask`, `gate_universe`. `_expand_active_pairs` uses numpy broadcasting for efficient date × membership activity computation.
+- `risk.py` — Stateless `compute_constrained_weights`, `realised_volatility`. Handles vol targeting, turnover caps, EWMA vs simple rolling vol, group caps, max active positions. Delegates constraint optimisation to `engine.optimizer`.
+- `tool_layer.py` — `ToolLayer` dataclass with `apply_patch`, `validate_config`, `preview_diff`, `run_analysis`. Includes rate limiting, path sandboxing, and JSONL call logging. Only imported by `src/trend_analysis/api_server/__init__.py`.
+- `walk_forward.py` — Standalone YAML-config-driven parameter sweep that writes CSV/JSONL/PNG output. Imported by `scripts/walk_forward.py` (only). See issue below.
+- `presets.py` — YAML-driven preset registry (`lru_cache`-backed) that loads `TrendPreset` objects from `config/presets/*.yml`. Provides `apply_trend_preset`, `get_trend_preset`, `list_preset_slugs`, plus metric pipeline configuration and UI aliases.
+- `pipeline.py` — Integration hub: imports from stages, `pipeline_runner`, `pipeline_helpers`, wires them together. Exports `run()`, `run_full()`, `run_analysis()`, `compute_signal()`, `position_from_signal()`. Contains the `_sync_stage_dependencies()` monkeypatch coordinator — see note below.
+- `regimes.py` — `RegimeSettings`, `compute_regimes`, `aggregate_performance_by_regime`, `build_regime_payload`. Two detection methods: `rolling_return` and `volatility`. Integrates with the perf cache via `_compute_regime_series`.
+- `data.py` — `load_csv`, `load_parquet`, `validate_dataframe`, `identify_risk_free_fund`, `ensure_datetime`, `compute_inception_dates`. Central data ingestion layer. See issue below.
+- `api.py` — Main public API: `run_simulation(config, returns) -> RunResult`. `RunResult` wraps metrics, weights, exposures, turnover, costs, portfolio series, and multi-period period results. Detects `config.multi_period` and delegates to `_run_multi_period_simulation()`.
+- `pipeline_helpers.py` — Config-resolution helpers (`_cfg_value`, `_cfg_section`, `_section_get`, `_resolve_sample_split`, `_derive_split_from_periods`, `_policy_from_config`, `_build_trend_spec`, `_attach_calendar_settings`), regime override application, turnover cap parsing, plus `compute_signal()` and `position_from_signal()`.
 
 ---
 
 ## Issues Found
 
-### 1. `pipeline_entrypoints.py` — `risk_free_column` assigned twice
+### 1. `pipeline_entrypoints.py` — Redundant duplicate assignment of `risk_free_column`
 
-In `run_full_from_config`, `risk_free_column` is assigned on line 232 and again on line 235 with a different expression. The second assignment silently overwrites the first. This is a copy-paste error — one of the two assignments is wrong.
+In `run_full_from_config`, lines 232 and 235 assign `risk_free_column` with **identical** right-hand sides:
 
-**Recommendation:** Read both assignments and determine which is correct; delete the other. The bug is silent in production because the second assignment always wins.
+```python
+# line 232
+risk_free_column = bindings.section_get(data_settings, "risk_free_column")
+# line 235 (identical)
+risk_free_column = bindings.section_get(data_settings, "risk_free_column")
+```
 
----
+This is not a behavioural bug (both RHS evaluate to the same value), just redundant code — one line is a dead statement.
 
-### 2. `pipeline_entrypoints.py` — Config extraction duplicated between `run_from_config` and `run_full_from_config`
-
-Both functions open with ~80 lines of identical config extraction boilerplate (resolving universe, split, signals, risk settings, regime overrides, etc.). This makes future changes to the config schema require updates in two places.
-
-**Recommendation:** Extract the shared block into a private `_extract_bindings(cfg) -> ConfigBindings` helper and call it from both functions.
-
----
-
-### 3. `pipeline_runner.py` — `_run_analysis()` is a trivial compat wrapper
-
-`_run_analysis(cfg, returns)` calls `_run_analysis_with_diagnostics(cfg, returns).unwrap()` and nothing else. It exists only so legacy callers that expect a bare result rather than a `PipelineResult` keep working.
-
-**Recommendation:** Document it explicitly as a compat wrapper (one-line comment). If no external callers remain outside `pipeline.py`, consider removing it and updating the single internal call site.
+**Recommendation:** Delete line 232. (Low-risk, no behavioural change.)
 
 ---
 
-### 4. `pipeline.py` — `_sync_stage_dependencies()` uses runtime `setattr` monkeypatching
+### 2. `pipeline_entrypoints.py` — Inconsistent risk-free resolution between the two entry points
 
-`_sync_stage_dependencies()` patches functions from `pipeline_helpers.py` into stage modules at call time using `setattr(module, name, fn)`. This enables test code to swap implementations but is non-obvious and breaks static analysis (mypy, IDEs lose cross-reference).
+`run_from_config` (line 102) resolves the risk-free column via the dedicated helper:
 
-**No immediate action required** — the pattern is intentional and documented in comments. Worth noting for future refactoring toward dependency injection.
+```python
+risk_free_column, allow_risk_free_fallback = resolve_risk_free_settings(
+    data_settings if isinstance(data_settings, Mapping) else None
+)
+```
 
----
+`run_full_from_config` (lines 235–236) reads the same fields directly via `section_get`:
 
-### 5. `data.py` — `load_csv` and `load_parquet` share ~80 lines of near-identical boilerplate
+```python
+risk_free_column = bindings.section_get(data_settings, "risk_free_column")
+allow_risk_free_fallback = bindings.section_get(data_settings, "allow_risk_free_fallback")
+```
 
-Both functions handle the same sequence: resolve `missing_policy`, apply `limit`, validate, `ensure_datetime`, and apply the same optional column filtering. The only difference is the read call (`pd.read_csv` vs `pd.read_parquet`).
+The `resolve_risk_free_settings` helper handles non-Mapping inputs and may apply defaults the direct reads miss. Two entry points resolving the same setting differently is a latent divergence source.
 
-**Recommendation:** Extract a `_load_file(read_fn, path, **kwargs) -> pd.DataFrame` helper that both delegate to. Reduces the duplication to a single maintenance point.
-
----
-
-### 6. `walk_forward.py` vs `engine/walkforward.py` — Two walk-forward implementations
-
-`walk_forward.py` (416 L) is a standalone YAML-config-driven parameter sweep that writes CSV/JSONL/PNG output. `engine/walkforward.py` exposes a lower-level `walk_forward(returns, cfg, folds) -> WalkForwardResult` function with `Split` and `WalkForwardResult` types used by the multi-period engine.
-
-Both are actively used by different callers. This is not dead code, but the two codepaths serve overlapping use cases (parameter sweep over folds) with incompatible APIs.
-
-**Recommendation:** No immediate action, but document the boundary. If the standalone module is ever extended, consider whether it should delegate to the engine-level function rather than re-implementing fold logic.
+**Recommendation:** Make `run_full_from_config` use `resolve_risk_free_settings` like its sibling.
 
 ---
 
-### 7. `presets.py` vs `signal_presets.py` — Two parallel preset systems
+### 3. `pipeline_entrypoints.py` — ~50 lines duplicated between `run_from_config` and `run_full_from_config`
 
-`signal_presets.py` (144 L) defines three hardcoded `TrendSpecPreset` objects (Conservative, Balanced, Aggressive) with lookup helpers used by both the Click CLI and the Streamlit UI.
+Lines 46–100 of `run_from_config` and lines 178–231 of `run_full_from_config` perform the same sequence: unwrap cfg, read sections, load CSV, attach calendar settings, resolve sample split, build stats cfg, resolve policy, build trend spec, read portfolio/run/vol_adjust sections, compute weight engine params. The two functions only diverge after `invoke_analysis_with_diag` is called.
 
-`presets.py` (426 L) provides a richer YAML-driven `TrendPreset` registry with metric pipeline configuration, UI aliases, and form defaults — also used by both CLI and UI.
+**Recommendation:** Extract the shared setup into a private helper returning a resolved-params dataclass. See prior conversation for a concrete sketch.
 
-The two systems coexist without cross-referencing each other. Neither wraps the other.
+---
 
-**Recommendation:** Determine which should be the canonical source for TrendSpec presets at the CLI/UI layer. If `presets.py` is the long-term target, migrate the hardcoded three from `signal_presets.py` into YAML config files and deprecate `signal_presets.py`. If both need to coexist, add a comment in each explaining the boundary.
+### 4. `data.py` — `load_csv` and `load_parquet` share ~50 lines of near-identical structure
+
+Both functions (lines 383–460 and 463–530) handle: legacy kwargs coercion, `Path` construction + existence/directory/permission checks, `_validate_payload` call, reset-index, and a matching `except`/logging block. The only real differences:
+
+- `pd.read_csv` vs `pd.read_parquet`
+- `load_csv` catches `pd.errors.ParserError` (parquet has no equivalent)
+- `load_csv` logs permission errors in non-raise mode; `load_parquet` always raises
+
+**Recommendation:** Extract a private `_load_file(read_fn, path, extra_except=(), ...)` helper that both delegate to. Keeps the small behaviour differences explicit via arguments.
+
+---
+
+### 5. `walk_forward.py` vs `engine/walkforward.py` — Two walk-forward implementations with different scopes
+
+Both modules exist and are actively used:
+
+- `trend_analysis.walk_forward.run_from_config` — YAML-driven orchestration (reads config, grid search, writes CSV/JSONL/PNG). Imported by `scripts/walk_forward.py`.
+- `trend_analysis.engine.walkforward.walk_forward` — Lower-level `walk_forward(returns, cfg, folds) -> WalkForwardResult` function used by `scripts/walkforward_cli.py` and `tests/test_walkforward_engine.py`.
+
+This is **not duplication** per se — the scopes differ (orchestration vs. computation). But the naming (`walk_forward.py` vs `walkforward.py`) and the lack of a delegation boundary (the orchestration module re-implements fold iteration rather than delegating to the engine) invite confusion.
+
+**Recommendation:** No urgent action. Add a module docstring to each making the boundary explicit, and consider whether future additions to the orchestration module should delegate to `engine.walkforward.walk_forward`.
+
+---
+
+### 6. `presets.py` and `signal_presets.py` — Two parallel-but-complementary preset systems
+
+Both are imported by both CLIs (`src/trend_analysis/cli.py:59,62` and `src/trend/cli.py:74,80`):
+
+- `signal_presets.py::TrendSpecPreset` — Three **hardcoded** presets (Conservative, Balanced, Aggressive), pure TrendSpec container.
+- `presets.py::TrendPreset` — YAML-driven, richer (includes metric pipeline, UI aliases, form defaults, vol-adjust defaults).
+
+They do not collide — CLIs use them side-by-side for different purposes. But `TrendPreset` is a proper superset of `TrendSpecPreset` in capability; the hardcoded three could be migrated into YAML config files and `signal_presets.py` retired.
+
+**Recommendation:** No urgent action. Longer-term, consolidate onto `presets.py` by promoting the three hardcoded presets to YAML and deprecating `signal_presets.py`.
+
+---
+
+## Notes (not actionable issues)
+
+### `pipeline_runner._run_analysis` is a deliberate test patch target
+
+`_run_analysis()` in `pipeline_runner.py` is a one-line bare-payload wrapper around `_run_analysis_with_diagnostics()`. It looks trivial, but it is imported into `pipeline.py` (line 51) and re-wrapped there as `pipeline._run_analysis`, which `_invoke_analysis_with_diag` (line 205) specifically checks for monkeypatching (`if _run_analysis is _DEFAULT_RUN_ANALYSIS:`). Tests and legacy callers patch `pipeline._run_analysis` to inject raw dict payloads; the wrapper is the documented contract for that. **Do not delete.**
+
+### `pipeline.py::_sync_stage_dependencies()` uses `setattr` monkeypatching
+
+Lines 103–134 apply `setattr` to `preprocessing_stage`, `selection_stage`, `portfolio_stage` on every `_call_with_sync` invocation. This is intentional — it ensures monkeypatches applied to `pipeline.*` symbols propagate into stage modules during tests. The docstring documents the rationale. This is unusual but functional; worth noting for future refactors toward explicit dependency injection.
 
 ---
 
 ## No Issues (clean files)
 
-- `weighting.py` — clean, stateful strategy hierarchy well-designed
-- `diagnostics.py` — clean, clear separation from `trend.diagnostics`
-- `schedules.py` — clean, distinct responsibility from `rebalancing.py`
-- `signals.py` — clean, excellent single responsibility
+- `weighting.py` — clean strategy hierarchy, stateful adaptive case well-designed
+- `diagnostics.py` — clean, clear delegation to `trend.diagnostics`
+- `schedules.py` — clean, distinct from `rebalancing.py`
+- `signals.py` — clean, single responsibility
 - `time_utils.py` — clean, single export
+- `logging.py` — clean JSONL logger, single responsibility
+- `__init__.py` — complex but necessarily so (dataclass patch, lazy submodules, matplotlib config)
 - `universe.py` — clean, efficient numpy-backed membership computation
 - `risk.py` — clean, stateless, well-composed
-- `regimes.py` — clean, two detection methods well-encapsulated
 - `tool_layer.py` — isolated to `api_server/`, coherent
-- `api.py` — complex but coherent; complexity is inherent to the integration surface
-- `pipeline_helpers.py` — large but coherent; signal utilities placement slightly odd but acceptable
+- `regimes.py` — clean, two detection methods well-encapsulated
+- `api.py` — complex but coherent; complexity inherent to the integration surface
+- `pipeline_helpers.py` — large but coherent
 
 ---
 
@@ -113,10 +154,20 @@ The two systems coexist without cross-referencing each other. Neither wraps the 
 
 | Priority | Action | File(s) |
 |----------|--------|---------|
-| High | Fix double assignment of `risk_free_column` | `pipeline_entrypoints.py:232–235` |
-| Medium | Extract shared config extraction into `_extract_bindings()` | `pipeline_entrypoints.py` |
-| Medium | Extract `_load_file()` helper to remove `load_csv`/`load_parquet` duplication | `data.py` |
-| Low | Determine canonical preset system; deprecate or document the boundary | `presets.py`, `signal_presets.py` |
-| Low | Document the boundary between the two walk-forward implementations | `walk_forward.py`, `engine/walkforward.py` |
-| Low | Mark `_run_analysis()` explicitly as a compat wrapper | `pipeline_runner.py` |
-| Info | Document `_sync_stage_dependencies()` monkeypatching rationale | `pipeline.py` |
+| Low | Delete redundant duplicate assignment (line 232) | `pipeline_entrypoints.py` |
+| Medium | Use `resolve_risk_free_settings` in `run_full_from_config` to match `run_from_config` | `pipeline_entrypoints.py` |
+| Medium | Extract shared config-resolution block into a private helper | `pipeline_entrypoints.py` |
+| Medium | Extract `_load_file()` helper to collapse `load_csv`/`load_parquet` boilerplate | `data.py` |
+| Low | Document the boundary between the two walk-forward modules | `walk_forward.py`, `engine/walkforward.py` |
+| Low | Longer-term: consolidate onto `presets.py`, retire `signal_presets.py` | `presets.py`, `signal_presets.py` |
+
+---
+
+## Corrections to the Prior Draft
+
+For reviewers comparing against the superseded draft:
+
+1. **Withdrawn:** "`_run_analysis()` is a trivial compat wrapper — consider removing it." It is a documented test patch target; removing it would break the pipeline's monkeypatch contract.
+2. **Corrected:** Previous text said "Click CLI." The CLIs in this repo use `argparse`, not Click. No Click import exists anywhere under `src/`.
+3. **Downgraded:** The `risk_free_column` double-assignment was described as a "copy-paste bug." Both assignments have identical RHS, so behaviour is unchanged — it's a redundant/dead statement, not a silent-corruption bug. Severity lowered from High to Low. A *separate* real issue (divergence in risk-free resolution between the two entry points) has been added as item 2.
+4. **Added:** `logging.py` and `__init__.py` to Files Reviewed (omitted from the prior draft — they belong in Day 4 by line-count ordering, and `logging.py` was incorrectly listed in Day 3's "clean files" section).
