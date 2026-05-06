@@ -1,6 +1,6 @@
 # Day 8 Review: `portfolio/`, `rebalancing/`, and `multi_period/` subpackages
 
-**Scope:** 9 files, ~5,090 lines — portfolio weight policy, rebalancing strategies, and the multi-period back-tester
+**Scope:** 9 files, ~5,090 lines — weight-policy cleanup, rebalancing strategies, and the multi-period back-tester
 **Date:** 2026-04-28
 **Reviewer:** Claude
 
@@ -8,64 +8,74 @@
 
 ## Files Reviewed
 
-- `portfolio/__init__.py` — Re-exports `apply_weight_policy`. Nothing else.
-- `portfolio/weight_policy.py` — `apply_weight_policy` handles three modes for cleaning weights when signals are invalid or absent: `drop` (remove and renormalise), `carry` (fill from previous weights then renormalise), `cash` (zero out and leave unnormalised so the residual is an implicit cash buffer). Used by `stages/portfolio.py` and the multi-period engine on every rebalance.
+- `portfolio/__init__.py` — Re-exports `apply_weight_policy`. Nothing else lives here.
+- `portfolio/weight_policy.py` — `apply_weight_policy` with three modes: `drop` (remove invalid assets and renormalise), `carry` (fill from previous weights then renormalise), and `cash` (zero-out and leave unnormalised so the residual is an implicit cash buffer). Used both by `stages/portfolio.py` (single-period) and the multi-period engine on every rebalance.
 - `multi_period/__init__.py` — Re-exports `Portfolio`, `run`, `run_from_config`, `run_schedule`. Clean.
-- `rebalancing/__init__.py` — Re-exports all five strategy classes plus registry utilities from `strategies.py`. Clean.
-- `multi_period/scheduler.py` — `generate_periods` builds a list of `PeriodTuple` (in-sample start/end, out-of-sample start/end) for a given frequency and date range, respecting partial final windows. Used by `multi_period/engine.py::run()`.
-- `multi_period/loaders.py` — `load_prices`, `load_membership`, `load_benchmarks`, `detect_index_columns`. Handles path resolution, validation, and UTC coercion; used by `run_from_config`.
-- `multi_period/replacer.py` — `Rebalancer` class: per-period z-score based fund entry/exit logic with soft and hard thresholds, cooldown tracking via `_entry_strikes` / `_strikes`, and a random-selection mode. See issue below.
-- `rebalancing/strategies.py` — Five `Rebalancer` subclasses registered by name: `TurnoverCapStrategy` (prioritised trade execution within a turnover budget), `PeriodicRebalanceStrategy` (every-N-periods rebalance), `DriftBandStrategy` (rebalance only assets that have drifted beyond a band), `VolTargetRebalanceStrategy` (scale to hit a target volatility via leverage), `DrawdownGuardStrategy` (scale back exposure when a drawdown threshold is breached). All share the same `_apply_cash_policy` helper and `apply_rebalancing_strategies` chaining function.
-- `multi_period/engine.py` — The multi-period back-tester (3,898 lines). Exposes `run`, `run_from_config`, `run_schedule`, and `Portfolio`. See issues below.
+- `rebalancing/__init__.py` — Re-exports the five strategy classes plus the registry helpers from `strategies.py`. Clean.
+- `multi_period/scheduler.py` — `generate_periods` builds a list of `PeriodTuple` (in-sample start/end, out-of-sample start/end) for a given frequency and date range, respecting partial final windows. Drives the period loop in `engine.run()`.
+- `multi_period/loaders.py` — `load_prices`, `load_membership`, `load_benchmarks`, plus a heuristic `detect_index_columns`. Handles path resolution, validation, and UTC coercion; called from `run_from_config`.
+- `multi_period/replacer.py` — `Rebalancer` class: per-period z-score-based fund entry/exit logic with soft and hard thresholds, cooldown tracking via `_entry_strikes` / `_strikes`, and a random-selection mode. See issue below about the docstring.
+- `rebalancing/strategies.py` — Five `Rebalancer` subclasses registered by name: `TurnoverCapStrategy`, `PeriodicRebalanceStrategy`, `DriftBandStrategy`, `VolTargetRebalanceStrategy`, `DrawdownGuardStrategy`. They all share a `_apply_cash_policy` helper and a `apply_rebalancing_strategies` chaining function.
+- `multi_period/engine.py` — The multi-period back-tester (3,898 lines). Exposes `run`, `run_from_config`, `run_schedule`, and the `Portfolio` dataclass. This is where most of the issues live.
 
 ---
 
 ## Issues Found
 
-### 1. `run()` in `engine.py` is two separate algorithms in one 3,800-line function
+### 1. `run()` in `engine.py` is two algorithms wedged into one 3,150-line function
 
-The `run()` function (lines 736–3,885) branches at line 1038 on `cfg.portfolio.get("policy") == "threshold_hold"`. The two branches share only data loading and config parsing; after the split they have no interaction:
+`run()` spans lines 736–3,885 and branches at line 1038 on `cfg.portfolio.get("policy") == "threshold_hold"`. The two branches have no interaction after the split:
 
-- **Standard path** (~185 lines, 1039–1223): calls `_call_pipeline_with_diag` once per period, no persistent selection state.
-- **Threshold-hold path** (~2,660 lines, 1225–3,885): full selection loop with z-score entry/exit, sticky rules, cooldown tracking, min/max fund enforcement, intra-period rebalancing, manager change logs, tenure tracking, regime-based turnover caps, and weight-bounds enforcement.
+- **Standard path** (lines 1039–1223, ~185 lines): one call to `_call_pipeline_with_diag` per period, no persistent selection state.
+- **Threshold-hold path** (lines 1225–3,885, ~2,660 lines): full selection loop with z-score entry/exit, sticky-add/sticky-drop rules, cooldown tracking, min/max fund enforcement, manager-change logs, tenure tracking, regime-aware turnover caps, and weight-bounds enforcement.
 
-The threshold-hold path also defines roughly 20 nested functions that close over mutable loop state (`cooldown_book`, `holdings_tenure`, `low_weight_strikes`, `add_streaks`, `drop_streaks`). Because they're closures rather than methods, the shared state is invisible from the function signatures and the mutation side-effects are implicit.
+The threshold-hold branch defines 19 nested helpers (the count from `^    def ` in that range), several of which close over mutable loop state — `cooldown_book`, `holdings_tenure`, `low_weight_strikes`, `add_streaks`, `drop_streaks`. Because they're closures rather than methods, the shared state is invisible from the function signatures and the mutation is implicit at every call site.
 
-**Recommendation:** Extract the threshold-hold path into a separate internal function (e.g. `_run_threshold_hold(df, cfg, ...)`) so that `run()` becomes a short router that calls either path. The nested closures would then naturally become module-level helpers or methods of a small selection-state class. This is the highest-priority structural issue in these packages.
+**Recommendation:** Extract the threshold-hold path into its own internal function (e.g. `_run_threshold_hold(df, cfg, ...)`) so `run()` becomes a short router that picks one of two paths. Once that's done, the nested closures become natural candidates to move to module-level helpers, or to methods on a small selection-state class. This is the highest-value structural change in these packages.
 
 ---
 
-### 2. `_min_tenure_protected` and `_min_tenure_guard` are identical
+### 2. `_min_tenure_protected` and `_min_tenure_guard` are the same function
 
-Both closures are defined inside the threshold-hold path (lines 1714 and 1724). They have different names and slightly different signatures — `_min_tenure_protected` takes a `score_frame` parameter that it never uses — but the body of each is character-for-character the same: iterate over `holdings`, check `holdings_tenure`, add to a `protected` set, return.
+Both are nested closures inside the threshold-hold path, defined nine lines apart at lines 1714 and 1724. The bodies are character-for-character identical: iterate over `holdings`, check `holdings_tenure`, build a `protected` set, return. The only difference is that `_min_tenure_protected` takes a second `score_frame` parameter that it never uses.
 
 ```python
-# _min_tenure_protected (line 1714) — score_frame unused
+# line 1714
 def _min_tenure_protected(holdings, score_frame) -> set[str]:
-    ...  # identical body
+    if min_tenure_n <= 0:
+        return set()
+    protected: set[str] = set()
+    for mgr in holdings:
+        ...
 
-# _min_tenure_guard (line 1724) — no score_frame
+# line 1724
 def _min_tenure_guard(holdings) -> set[str]:
-    ...  # identical body
+    if min_tenure_n <= 0:
+        return set()
+    protected: set[str] = set()
+    for mgr in holdings:
+        ...   # same body
 ```
 
-**Recommendation:** Delete `_min_tenure_protected`. All call sites should use `_min_tenure_guard`.
+Call sites: `_min_tenure_protected` is used at lines 2580 and 3264 (always with `sf` as the second argument); `_min_tenure_guard` is used at line 3373.
+
+**Recommendation:** Delete `_min_tenure_protected` and update both call sites to drop the unused `sf` argument and call `_min_tenure_guard` instead.
 
 ---
 
-### 3. Turnover computation is implemented twice in `run_schedule`
+### 3. Turnover computation is implemented twice in the same module
 
-`engine.py` has a module-level `_compute_turnover_state` (lines 282–324) that computes one-sided turnover between two weight vectors via pandas alignment. `run_schedule` (lines 524–733) defines a nested `_fast_turnover` closure (lines 576–630) that does the same computation via manually-built Python dicts, described in its docstring as a faster alternative.
+`_compute_turnover_state` (module level, lines 282–324) computes one-sided turnover between two weight vectors via pandas alignment. `run_schedule` then defines a nested `_fast_turnover` closure (lines 576–630) that does the same computation via manually-built Python dicts, with a docstring describing it as "vectorised using NumPy".
 
-`run_schedule` then uses `_fast_turnover` in the if-branch (lines 682–684) and `_compute_turnover_state` in the else-branch (lines 691), within the same loop.
+Inside the same `run_schedule` loop, `_fast_turnover` is used in the if-branch (lines 682–684) and `_compute_turnover_state` is used in the else-branch (line 691). Both produce the same result by construction. Both have direct test coverage: `tests/test_multi_period_engine.py`, `test_turnover_vectorization.py`, and others exercise `_compute_turnover_state` directly; `test_multi_period_engine_turnover_regression.py` and friends exercise `_fast_turnover` end-to-end through `run_schedule`.
 
-The two implementations produce the same result by construction. The performance difference is real but both paths already exist in the same module, and the duplication means any correctness fix must be applied to both.
+The two implementations are not algorithmically equivalent in performance terms — `_fast_turnover` builds Python dicts and iterates in Python; `_compute_turnover_state` does pandas reindex-into-numpy. For realistic universe sizes the pandas path is likely the faster of the two, despite the closure's docstring framing it as the speedup.
 
-**Recommendation:** Benchmark whether the dict-based approach is materially faster for realistic universe sizes. If it is, replace `_compute_turnover_state` with the faster version and delete the older one. If it isn't, delete `_fast_turnover` and use `_compute_turnover_state` in both branches.
+**Recommendation:** Benchmark both at typical universe sizes (50–500 columns). Whichever wins, delete the loser and use the survivor in both branches. The duplication means any correctness fix has to be applied twice and gets caught by different test suites.
 
 ---
 
-### 4. `apply_missing_policy` is called for observability only, with the result discarded
+### 4. `apply_missing_policy` is called twice per run, with the first call's result discarded
 
 `run()` lines 871–878:
 
@@ -80,23 +90,42 @@ except Exception:  # pragma: no cover - best-effort only
     pass
 ```
 
-The return value is silently discarded. The comment says "Legacy behavior: call apply_missing_policy in this module so tests can monkeypatch it for observability." The actual data-cleaning call that produces the `filled` frame used downstream is ~60 lines later (lines 930–944).
+The return value is dropped on the floor. The comment above it says "Legacy behavior: call apply_missing_policy in this module so tests can monkeypatch it for observability." The actual data-cleaning call that produces the `filled` frame used downstream is ~60 lines later (lines 930–944), where the result is captured in `filled, _missing_result = ...`.
 
-This pattern means `apply_missing_policy` is called twice per run in the non-skip path: once as a no-op tracer, once for real. It also means the first call's `TypeError` fallback (lines 937–944) exists because some test patches implement a simplified signature. The real call already has that fallback, so the test-observability call could be replaced with a single `# tests monkeypatch apply_missing_policy` comment and an unconditional call to the real path.
+This pattern means `apply_missing_policy` runs twice on every non-skip path: once as a no-op tracer, once for real. The tests in `test_multi_period_engine_branch_new.py`, `test_multi_period_engine_keepalive.py`, and `test_multi_period_engine_missing_policy.py` all monkeypatch the module-level binding to capture arguments. Because both calls hit the patched function and the second-call captures overwrite the first, the first call is genuinely vestigial — removing it would not break any of the existing assertions about `policy` / `limit` capture.
 
-**Recommendation:** Remove the phantom first call and consolidate into the real data-cleaning call at line 930. Document in that call's comment why `apply_missing_policy` is imported at module scope (for test monkeypatching).
+**Recommendation:** Remove the phantom first call. The real call at line 930 already invokes the module-level `apply_missing_policy`, which is what tests monkeypatch. Add a one-line comment at the import (line 59) or at the real call site explaining that the module-level binding exists for monkeypatching.
 
 ---
 
-### 5. `multi_period/replacer.py` has a stale module docstring
+### 5. The threshold-hold branch calls `cfg.model_dump()` four times in a row
 
-The docstring on the module says:
+Lines 1226, 1235, 1530, and 1671 each invoke `cfg.model_dump()` to get a dict snapshot of the pydantic config:
+
+```python
+periods = generate_periods(cfg.model_dump())                              # 1226
+mp_cfg = cast(dict[str, Any], cfg.model_dump().get("multi_period", {}))   # 1235
+...
+mp_cfg = cast(dict[str, Any], cfg.model_dump().get("multi_period", {}))   # 1530 — same as 1235
+...
+rebalancer = Rebalancer(cfg.model_dump())                                  # 1671
+```
+
+`model_dump()` walks the entire pydantic model and produces a fresh dict each time. The cost is small in absolute terms but the duplication is unnecessary — and the line-1530 reassignment to `mp_cfg` overwrites the line-1235 value with what should be the same content.
+
+**Recommendation:** Compute `cfg_dump = cfg.model_dump()` once at the top of the threshold-hold branch and reuse it for `generate_periods`, the two `mp_cfg` extractions, and the `Rebalancer` constructor. This also makes it obvious that the branch reads from a single config snapshot.
+
+---
+
+### 6. `multi_period/replacer.py` has a stale module docstring
+
+The first lines of the module say:
 
 > *Phase-2 placeholder: echoes the incoming weights so the rest of the pipeline keeps running. Real strike / replacement logic comes later.*
 
-The class now has a ~200-line implementation covering hard/soft z-score exits, soft entry with `entry_soft_strikes`, capacity-limited additions, random-selection mode, and Bayesian weighting. "Placeholder" no longer applies.
+The class now has a ~200-line implementation covering soft/hard z-score exits, soft entry with `entry_soft_strikes` accumulation, capacity-limited additions in priority order (hard > auto > eligible), random-selection mode, and Bayesian score-proportional weighting. "Echoes the incoming weights" hasn't been true for a while.
 
-**Recommendation:** Rewrite the module docstring to describe what the class actually does.
+**Recommendation:** Rewrite the docstring to describe what `Rebalancer` actually does, particularly the entry/exit thresholds, the strike-counting state, and the random-selection branch.
 
 ---
 
@@ -104,31 +133,31 @@ The class now has a ~200-line implementation covering hard/soft z-score exits, s
 
 ### `scheduler.py::FREQ_MAP` has 17 entries for three underlying aliases
 
-`FREQ_MAP` maps `"M"`, `"ME"`, `"monthly"`, `"MONTHLY"`, `"Monthly"` (and similar variants for quarterly and annual) all to the same targets. This works and is exhaustive, but a case-normalised lookup against three canonical strings would be easier to maintain if new user-friendly names are ever added.
+`FREQ_MAP` maps `"M"`, `"ME"`, `"monthly"`, `"MONTHLY"`, `"Monthly"` (and similar variants for quarterly and annual) all to the same canonical targets. This works and is exhaustive, but a case-normalised lookup against three canonical strings would be smaller and easier to extend if anyone ever adds new user-friendly names.
 
 ### `rebalancing/strategies.py::RebalancingStrategy` is a backwards-compatibility alias
 
-Line 21: `RebalancingStrategy = Rebalancer`. It's in `__all__`, re-exported from `rebalancing/__init__.py`, and appears in `__init__.py`'s `__all__` as well. Callers using `RebalancingStrategy` will get the same object. Low risk, worth knowing.
+Line 21 has `RebalancingStrategy = Rebalancer`. It's in `__all__`, re-exported from `rebalancing/__init__.py`, and listed in that package's `__all__` too. Anyone reading the strategies module sees two names for one thing. Low risk, worth knowing about.
 
 ### `multi_period/engine.py` re-exposes a `_run_analysis` shim for test monkeypatching
 
-Lines 87–88 define a module-level `_run_analysis` that delegates to `_invoke_analysis_with_diag`. This mirrors the same pattern used in `stages/portfolio.py::avg_corr_handler` (Day 6): a named module-level attribute that tests can replace via monkeypatching. The comment at line 84 explains it clearly. Not a bug, just the same known pattern.
+Lines 87–88 define a module-level `_run_analysis` that delegates to `_invoke_analysis_with_diag`. This mirrors the pattern in `stages/portfolio.py::avg_corr_handler` (Day 6): a named module-level attribute that tests can replace via monkeypatching. The comment at line 84 calls this out clearly. Not a bug, just the same known pattern.
 
-### The covariance-diag block inside `run()` accumulates complexity over time
+### The covariance-diagnostic block inside `run()` accumulates complexity over time
 
-Lines 1127–1221 attach an experimental `cov_diag` key to each period result when `enable_cache` is true. This includes incremental covariance update logic (shift-detection, sequential row swaps) that is controlled by an `os.getenv("DEBUG_TURNOVER_VALIDATE")` style flag (`performance.incremental_cov`). The feature appears sound but the condition nesting is deep. If it ever becomes non-experimental, it would benefit from extraction into its own helper.
+Lines 1127–1221 attach an experimental `cov_diag` key to each period result when `enable_cache` is true. This includes incremental covariance update logic (shift-detection by trailing-block compare, sequential row swaps) that is gated by `performance.incremental_cov`. The feature appears sound but the condition nesting is deep and the imports of `compute_cov_payload` / `incremental_cov_update` are duplicated inside both branches of the inner `if`. If this stops being experimental, it's a good candidate for extraction into its own helper.
 
 ---
 
 ## No Issues (clean files)
 
 - `portfolio/__init__.py` — clean
-- `portfolio/weight_policy.py` — clean, well-scoped
+- `portfolio/weight_policy.py` — clean, well-scoped, the three modes are documented and exercised
 - `multi_period/__init__.py` — clean
 - `rebalancing/__init__.py` — clean
-- `multi_period/scheduler.py` — clean; `FREQ_MAP` verbosity is a style preference, not a bug
-- `multi_period/loaders.py` — clean; error messages are clear, fallback detection is explicit
-- `rebalancing/strategies.py` — clean, well-structured; all five strategy classes follow the same interface
+- `multi_period/scheduler.py` — clean; the `FREQ_MAP` verbosity is a style preference, not a bug
+- `multi_period/loaders.py` — clean; error messages are clear and the benchmark fallback warns rather than raises
+- `rebalancing/strategies.py` — clean, well-structured; the five strategy classes follow a consistent interface
 
 ---
 
@@ -136,8 +165,9 @@ Lines 1127–1221 attach an experimental `cov_diag` key to each period result wh
 
 | Priority | Action | File(s) |
 |----------|--------|---------|
-| Medium | Extract the threshold-hold branch of `run()` into its own function; promote nested closures to module-level helpers | `multi_period/engine.py` |
-| Low | Delete `_min_tenure_protected`; replace call sites with `_min_tenure_guard` | `multi_period/engine.py` |
-| Low | Consolidate the two turnover-computation implementations into one | `multi_period/engine.py` |
+| Medium | Extract the threshold-hold branch of `run()` into its own function; promote nested closures to module-level helpers or a state class | `multi_period/engine.py` |
+| Low | Delete `_min_tenure_protected`; replace its two call sites with `_min_tenure_guard` | `multi_period/engine.py` |
+| Low | Pick one turnover implementation, delete the other | `multi_period/engine.py` |
 | Low | Remove the phantom `apply_missing_policy` call and document the monkeypatching pattern at the real call site | `multi_period/engine.py` |
-| Low | Update the stale module docstring in `replacer.py` | `multi_period/replacer.py` |
+| Low | Compute `cfg.model_dump()` once at the top of the threshold-hold branch and reuse it | `multi_period/engine.py` |
+| Low | Rewrite the stale module docstring in `replacer.py` | `multi_period/replacer.py` |
