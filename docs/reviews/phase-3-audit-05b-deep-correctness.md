@@ -13,11 +13,19 @@
 
 | # | Function | Finding | Severity |
 |---|----------|---------|----------|
-| 1 | `_compute_weights_and_stats` | Vol-targeting `scale_factors` appear applied **twice** to the user portfolio (weights already carry the tilt, returns are scaled again) | High **if confirmed** |
+| 1 | `_compute_weights_and_stats` | ~~Vol-targeting `scale_factors` applied twice~~ **CORRECTED — not a bug** (numerically tested in audit-06) | ~~High~~ → Low (doc) |
 | 2 | `_compute_weights_and_stats` | `_compute_stats` ignores `window.periods_per_year`; annualisation hardcoded to 12 via metric defaults | Medium |
 | 3 | `_compute_weights_and_stats` | `monthly_cost` subtracted from every asset every period (holding-cost, not turnover-based) | Low (confirm intent) |
 | 4 | `rank_select_funds` | `_dedupe_by_firm` backfill is O(n²) (`name in chosen` on a list) | Low |
 | — | `rank_select_funds` | Sort order / `bottom_k` / threshold semantics | ✅ Correct |
+
+> **CORRECTION (see audit-06):** Finding ① was tested numerically against the real
+> `compute_constrained_weights`. The double-application of `scale_factors` is real
+> arithmetically, but it produces a *coherent* vol-targeted portfolio (realised vol
+> sensibly below target due to diversification), and my proposed fix (unscaled returns)
+> actually overshoots the target and is worse. Finding ① is therefore **not a correctness
+> bug** and is downgraded to a Low documentation note ("equal" weighting is re-tilted
+> toward low-vol assets under vol targeting). Findings ②–④ stand.
 
 ---
 
@@ -97,9 +105,16 @@ All metric functions default `periods_per_year: int = 12` (`metrics/__init__.py:
 
 `rank_select_funds` is **correct** (one negligible efficiency nit).
 
-`_compute_weights_and_stats` has one **material, must-confirm** issue: the vol-targeting scale appears to be applied twice to the user portfolio (exposure ∝ base·scale²) and inconsistently versus the equal-weight benchmark (scale once). If confirmed, it distorts every vol-targeted run's returns and the user-vs-EW comparison. Finding ② is a smaller latent inconsistency (hardcoded annualisation). Both are cheap to fix and both warrant regression tests.
+`_compute_weights_and_stats`: finding ① (vol-scale double-application) was the headline
+smell, but the numerical fixture in **audit-06 refuted it** — the behaviour is coherent
+vol targeting, not a bug, and my proposed fix was wrong. The remaining valid item is
+finding ② (hardcoded annualisation at 12 in `_compute_stats`), a latent inconsistency for
+non-monthly data, plus the Low cost-model note (③).
 
-**These are static-analysis findings.** Finding ① in particular should be verified with a numerical fixture before any change — I am flagging a strong smell and the exact mechanism, not asserting a proven defect.
+**Lesson recorded:** finding ① was a static-analysis smell that looked High-severity and
+turned out wrong once tested. The correct move was exactly what was done — verify with a
+numerical fixture before recommending any change. This document is left in place (with the
+correction banner above) rather than deleted, so the reasoning trail is preserved.
 
 ---
 
