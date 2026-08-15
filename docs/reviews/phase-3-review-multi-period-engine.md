@@ -1,38 +1,22 @@
-# Phase-3 Review: Multi-Period Engine
-
-**Date:** 2026-07-16
-**Reviewer:** Project review
-**Branch:** `phase-3`
-**Scope:** `src/trend_analysis/multi_period/` — `engine.py`, `scheduler.py`, `loaders.py`, `replacer.py`
-
-*This consolidates and supersedes audit-07 (structure) and audit-07b (correctness). Read this one.*
+# Multi-Period Engine
+**Scope:** `multi_period/{engine,scheduler,loaders,replacer}.py`
 
 ---
 
-## The short version
+## Subsystem Summary
 
-The engine is **correct where it counts and hard to maintain where it hurts**.
-
-I went looking for the thing that would actually invalidate results — look-ahead bias — and didn't find it. Window construction, selection, and return realisation are all cleanly separated in time. The turnover and cost logic is genuinely well thought through; a couple of details in there are sharper than I expected.
-
-The problem is structural. One function is 2,440 lines long. That's 55% of the file in a single unit that can't be tested in pieces, can't be reviewed with confidence, and quietly re-implements logic that already exists elsewhere in the codebase. Nothing is broken today. But this is where a future bug will hide, and it will be expensive to find.
-
----
-
-## What's in here
-
-| File | Lines | What it does |
-|------|-------|--------------|
-| `engine.py` | 4,398 | Scheduling, universe/selection, weighting, turnover & cost, result assembly |
-| `loaders.py` | 227 | `load_prices` / `load_membership` / `load_benchmarks` |
+| File | Lines | Role |
+|------|-------|------|
+| `engine.py` | 4398 | Period scheduling, universe/selection, weighting, turnover & cost, result assembly |
+| `loaders.py` | 227 | `load_prices` / `load_membership` / `load_benchmarks` / `detect_index_columns` |
 | `replacer.py` | 227 | `Rebalancer` |
 | `scheduler.py` | 140 | `generate_periods` |
 
-And the size distribution inside `engine.py`, which is really the story of this review:
+Size distribution inside `engine.py`:
 
 | Lines | Function | Span |
 |------:|----------|------|
-| **2,440** | `_run_threshold_hold_multi_periods` | L1936–L4375 |
+| **2440** | `_run_threshold_hold_multi_periods` | L1936–L4375 |
 | 343 | `run` | L1591–L1933 |
 | 210 | `run_schedule` | L1049–L1258 |
 | 182 | `_run_phase1_multi_periods` | L1261–L1442 |
@@ -41,125 +25,138 @@ And the size distribution inside `engine.py`, which is really the story of this 
 
 ---
 
-## No look-ahead bias
+## Positive / Clean
 
-This was the main thing I wanted to establish, because everything else is cosmetic by comparison. If a backtest engine lets future data leak into past decisions, every number it produces is fiction.
+### The decomposition seams already exist
+`engine.py` defines four typed dataclasses and matching module-level helpers that model the per-period lifecycle cleanly: `_PeriodSetup`/`_setup_period` (`:372`, `:379`), `_PeriodWeights`/`_weight_period` (`:419`, `:440`), `_TurnoverCostApplication`/`_apply_turnover_and_cost` (`:426`, `:473`), `_PeriodResultAssembly`/`_assemble_period_result` (`:433`, `:601`). All are keyword-only, fully annotated, and independently testable. This is good structure — the problem in finding ① is that the main loop only partially uses it.
 
-It doesn't. Four checks, all clean:
+### `_apply_turnover_and_cost` is well-written
+126 lines, keyword-only signature, returns a typed dataclass, and the non-obvious branches carry comments explaining *why* (e.g. `:584-587` documents that renormalisation is skipped when weights don't already sum to ~1, to preserve infeasible bound outcomes). This is the standard the rest of the module should meet.
 
-**The schedule can't overlap.** In `generate_periods`, in-sample ends exactly one period before out-of-sample starts — `in_end_period = out_start_period - 1` (`scheduler.py:96`) and `out_start_period = in_end_period + 1` (`:102`). The windows are adjacent by construction, so there's no arithmetic path that produces an overlap.
-
-**Selection only ever sees in-sample data.** Scoring, z-scores, and ranking all read from `in_df`. I traced the score-frame construction and the selector wiring; nothing reaches into the out-of-sample slice.
-
-**Returns are realised only on out-of-sample data.** Per-period performance comes from `out_df` / `out_scaled` — e.g. `rebalance_returns = (out_scaled * weights_by_date).sum(axis=1)` (`engine.py:4330`).
-
-**The slicer preserves the separation.** `stages/preprocessing._build_sample_windows` resolves both boundaries through the shared `resolve_period_bound` helper with inclusive masks, so the non-overlap the scheduler guarantees survives all the way into the actual data slices.
-
-I couldn't find a route where out-of-sample returns influence same-period selection or weighting.
-
----
-
-## It reuses the single-period pipeline (good)
-
-Worth calling out, because it's the kind of decision that quietly prevents a whole class of bugs.
-
-The per-period loop doesn't compute returns or statistics itself. It builds the universe, runs selection, produces target weights — then hands off to the single-period pipeline via `_call_pipeline_with_diag → _run_analysis` (`engine.py:4063`), which is the same `_compute_weights_and_stats` reviewed earlier.
-
-Practically, that means per-period return math is *already reviewed code*, and single-period and multi-period runs can't drift apart in how they compute performance. The engine's genuinely unique responsibilities are narrower than the file size suggests: scheduling, the hold-state machine, and carrying turnover/cost state across periods.
-
----
-
-## The turnover and cost logic is good
-
-`_apply_turnover_and_cost` (L473–598) is the most carefully written part of the engine. Four things it gets right:
-
-**Forced exits don't get diluted.** When a holding trips a z-exit threshold, it's targeted to zero *after* the turnover penalty is applied (`:514-518`), so the penalty can't partially undo a decision the strategy already made.
-
-**Forced exits also survive the turnover cap.** Trades are split into mandatory (forced exits, required min-fund entries) and optional. Mandatory executes first; optional gets scaled into whatever cap remains (`:548-570`). Without this, a below-threshold holding could linger indefinitely just because the book was busy — a subtle and genuinely nasty failure mode that someone clearly thought about.
-
-**Renormalisation is conditional, and deliberately so.** Weights are only rescaled to sum to 1 when they *already* sum to about 1 (`:582-589`). If min-weight floors push the total above 1, or max-weight caps hold it below, that infeasibility is preserved rather than papered over. The comment says as much. This is the sort of thing that looks like a bug until you read why it isn't.
-
-**State carry-forward is consistent.** `_assemble_period_result` (L601–644) increments tenure for surviving holdings and passes non-zero final weights forward as the baseline for next period's turnover calculation.
-
-One more: when weights change *within* an out-of-sample window, the engine recomputes `out_user_stats` on the actual date-varying path rather than reporting the static-weight approximation (`:4326-4352`), including cash returns. That's the honest number, and it would have been easy to skip.
+### `scheduler.py` / `loaders.py` / `replacer.py` are appropriately sized
+140–227 lines each, single-purpose, no findings.
 
 ---
 
 ## Findings
 
-### 1. `_run_threshold_hold_multi_periods` is 2,440 lines — High (maintainability)
+### ① `_run_threshold_hold_multi_periods` — 2,440 lines, 11 parameters, 21 nested closures — High
 
-One function, 11 parameters, L1936–L4375. Over half the file. It contains the entire threshold-hold path inline: period generation, universe construction, scoring, Bayesian weighting, turnover and cost, regime overrides, result assembly — plus dozens of nested closures that make up much of the bulk.
+L1936–L4375. 55% of the file in one function. Beyond raw length, the structural problem is that it defines **21 closures inline**:
 
-Why this matters beyond aesthetics:
+```
+_parse_month  _valid_universe  _score_frame  _ensure_zscore  _parse_optional_float
+_firm  _eligible_sticky_add  _min_tenure_protected  _min_tenure_guard
+_reapply_min_tenure_guard  _start_cooldown  _dedupe_one_per_firm
+_dedupe_one_per_firm_with_events  _rank_scores_for_bottom_k  _filter_entry_frame
+_filter_entry_candidates  _hard_exit_forced  _apply_policy_to_weights
+_ensure_holdings_weights  _enforce_min_funds  _compute_weights
+```
 
-- **It can't be unit tested.** There are no seams. You can test the whole thing or nothing.
-- **It can't be reviewed with confidence.** I'll say plainly below which parts of it I did *not* verify, and the reason is length.
-- **Bugs will be expensive.** A defect in the threshold-hold path lives somewhere in 2,440 lines with no smaller unit to isolate it in.
+Each of these closes over the enclosing scope, so none can be imported, called, or unit-tested in isolation — and their dependencies on outer-scope state are implicit rather than declared. Several (`_dedupe_one_per_firm`, `_hard_exit_forced`, `_enforce_min_funds`) are self-contained enough to be module-level functions taking explicit arguments.
 
-The frustrating part is that the seams already exist. `_setup_period`, `_weight_period`, `_apply_turnover_and_cost`, and `_assemble_period_result` are all module-level helpers with clean signatures — the loop calls them, but then re-inlines a great deal of logic around them instead of pushing that logic down too.
+The awkward part is that the module already demonstrates the better pattern: the four `_PeriodSetup`-style helpers above are module-level, typed, and keyword-only. The loop calls them, then re-inlines a large amount of logic around them instead of pushing that down too.
 
-**Recommendation:** decompose along the same lines the single-period pipeline already uses (`stages/`): period setup → selection → weighting → turnover/cost → assembly. The existing helpers are the natural starting points. This is the highest-value change available in this subsystem.
+**Recommendation:** lift the self-contained closures to module level with explicit parameters, and move the remaining per-stage logic into the existing `_setup_period` / `_weight_period` / `_apply_turnover_and_cost` / `_assemble_period_result` seams. Target shape is the `stages/` layout the single-period pipeline already uses.
 
-### 2. Constraint logic is re-implemented, and it has already drifted — Medium
+### ② Constraint helpers duplicated against `risk.py` / `optimizer.py`, and already divergent — Medium
 
-The engine carries its own copies of logic that exists in the single-period risk stack:
+Three concepts are implemented twice:
 
 | Concept | Multi-period | Single-period |
 |---------|--------------|---------------|
 | Turnover penalty | `engine.py:966` | `risk.py:145` |
-| Max active positions | `engine.py:919` | `risk.py:193` |
-| Weight bounds | `engine.py:849` | `optimizer.apply_constraints` |
+| Max active positions | `engine.py:919` `_enforce_max_active_positions` | `risk.py:193` `_enforce_max_active` |
+| Weight bounds | `engine.py:849` `_apply_weight_bounds` | `optimizer.apply_constraints` |
 
-The turnover-penalty *formula* is the same in both — `prev + (target − prev) × (1 − λ)`. What differs is what happens next: the engine re-applies min/max weight bounds (`:981-984`), while `risk.py` renormalises and special-cases `λ ≥ 1`.
+The turnover-penalty formula is identical (`prev + (target − prev) × (1 − λ)`), but the two versions diverge immediately after: `engine.py:981-984` re-applies min/max weight bounds, while `risk.py` normalises and special-cases `λ ≥ 1`. Same config key, two behaviours, depending on which entry point runs.
 
-So the same `lambda_tc` in the same config produces slightly different behaviour depending on which engine you run. That's not a crash, it's worse — it's a silent inconsistency between two paths a user reasonably expects to agree. And two copies drift further apart over time, not closer.
+This is the failure mode duplication actually causes — not a crash, but two copies that were the same once and no longer are, with nothing in the code marking them as needing to stay in sync.
 
-**Recommendation:** pull the turnover / bounds / max-active primitives into one place (`risk.py`, or a new `weights/constraints.py`) and have both engines call it. If the bounds-vs-renormalise difference is intentional, make it an explicit parameter so the choice is visible.
+**Recommendation:** extract these three primitives into one module (`risk.py`, or a new `weights/constraints.py`) and have both engines import them. If the bounds-vs-normalise difference is deliberate, express it as a parameter so the divergence is visible at the call site instead of implied by which file you're in.
 
-### 3. `_accepts_keyword` exists three times — Low
+### ③ `_accepts_keyword` — three byte-identical copies — Low
 
-`multi_period/engine.py:4391`, `multi_period/loaders.py:26`, `pipeline_entrypoints.py:35`. Trivial helper, trivial fix, but it's three copies of the same six lines.
+`multi_period/engine.py:4391`, `multi_period/loaders.py:26`, `pipeline_entrypoints.py:35`. Same eight lines, same `inspect.signature` guard, verbatim in all three:
 
----
+```python
+def _accepts_keyword(func: Any, keyword: str) -> bool:
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    return keyword in params or any(
+        param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values()
+    )
+```
 
-## What I did not verify
+**Recommendation:** one home in `util/`, import in all three.
 
-I want to be straight about coverage, because "reviewed" can mean very different things for a function this size.
+### ④ Untyped `*args/**kwargs` shims — Low
 
-The **hold-state machine** — implemented as nested closures inside the main loop — I mapped and spot-checked, but did **not** verify branch by branch:
+Same pattern I flagged in `pipeline.py` (finding ④ there), repeated here at `engine.py:102-106`:
 
-- soft and hard z-entry / z-exit thresholds (`_hard_exit_forced`, `_filter_entry_candidates`)
-- sticky add/drop counters, `min_tenure` protection, cooldown reseed logic
-- one-per-firm dedup (`_dedupe_one_per_firm`)
-- buy-and-hold and random selection modes
-- turnover-budget max-changes gating (`engine.py:3734+`)
+```python
+def _run_analysis(*args: Any, **kwargs: Any) -> PipelineResult:
+    return _invoke_analysis_with_diag(*args, **kwargs)
 
-This is where most of the strategy's actual semantics live, and these rules interact — a fund can be simultaneously cooldown-blocked, tenure-protected, and z-exit-forced, and the resolution order matters.
+def _call_pipeline_with_diag(*args: Any, **kwargs: Any) -> DiagnosticResult[...]:
+```
 
-Reading 1,600 lines of interleaved conditionals is not a reliable way to verify that. The right tool is a fixture test: a small synthetic universe, a handful of periods, and explicit assertions about who enters, who exits, and what tenure counters look like at each step. I'd rather flag this honestly than imply coverage I don't have.
+The docstring is explicit that this exists so tests can monkeypatch `_run_analysis` and return raw dicts. That's a legitimate need, but the cost is that the engine's single most important call boundary — the handoff into the analysis pipeline — is untyped in both directions, so nothing checks that the loop is passing what the pipeline expects.
+
+**Recommendation:** give the shim the real signature (or `typing.ParamSpec`) and keep the monkeypatch seam via an explicit injectable rather than signature erasure. Low urgency; worth doing whenever ① is tackled, since both touch the same boundary.
+
+### ⑤ Nine function-level imports — Low
+
+Deferred imports scattered through the module: `:247`, `:1293`, `:1363`, `:1434`, `:1482`, `:1823`, `:2133`, `:2199`, `:2870` — pulling from `..plugins`, `..perf.cache`, `..data`, `..core.rank_selection`, `..selector`.
+
+Some may be deliberate circular-import breaks, but there's no comment saying so on any of them, so a reader can't tell "required" from "grew there." Two of them (`:1363`, `:1434`) import from `..perf.cache` in adjacent code paths, which suggests accretion rather than design.
+
+**Recommendation:** move to module level where no cycle exists; where a cycle does exist, add a one-line comment saying which one, so the next person doesn't "clean it up" and break the build.
+
+### ⑥ `cfg.model_dump()` recomputed five times — Low
+
+`:1277`, `:1952`, `:1961`, `:2254`, `:2357` — three of those inside `_run_threshold_hold_multi_periods`, and `:1961` / `:2254` compute the identical `mp_cfg` value:
+
+```python
+mp_cfg = cast(dict[str, Any], cfg.model_dump().get("multi_period", {}) or {})
+```
+
+Full Pydantic serialisation of the whole config, repeated, to read one sub-key. Minor cost, but it's also a correctness-adjacent smell: five independent snapshots of config state in one call path.
+
+**Recommendation:** dump once at entry, pass the dict (or the `mp_cfg` slice) down.
+
+### ⑦ Four-deep config key fallback chains — Low
+
+`:2270-2278`:
+
+```python
+cooldown_periods_raw = portfolio_cfg.get("cooldown_periods")
+if cooldown_periods_raw is None:
+    cooldown_periods_raw = portfolio_cfg.get("cooldown_months")
+if cooldown_periods_raw is None:
+    cooldown_periods_raw = mp_cfg.get("cooldown_periods")
+if cooldown_periods_raw is None:
+    cooldown_periods_raw = mp_cfg.get("cooldown_months")
+```
+
+Four accepted spellings across two config sections, with the precedence order encoded only by statement order and documented nowhere. `sticky_add_x` immediately below follows the same shape. Any of these keys can be set and silently lose to a higher-precedence one.
+
+**Recommendation:** at minimum a comment stating the precedence; better, resolve these aliases in the config layer (`config/` already has `lint_keys.py` for exactly this kind of key hygiene) so the engine reads one canonical name.
+
+### ⑧ Cross-module private import — Low
+
+`:2133` imports `_compute_metric_series` from `..core.rank_selection`. Importing another module's underscore-prefixed symbol means the engine depends on `rank_selection`'s private surface, so a refactor there breaks here with no signal.
+
+**Recommendation:** promote it to a public name in `rank_selection` if it's genuinely shared API.
 
 ---
 
 ## Verdict
 
-On the invariants that decide whether a backtest engine is trustworthy — no look-ahead, correct out-of-sample return realisation, correct turnover and cost carry-forward — this engine is **sound**. It also earns real credit for delegating return math to the single-period pipeline instead of duplicating it.
+**No correctness defects found in the paths reviewed**, and the module has real structural strengths: the four typed period-lifecycle dataclasses are exactly the right seams, and `_apply_turnover_and_cost` is a well-built, well-commented function.
 
-Its debt is size and duplication, not correctness. Two things worth doing, in order:
+The findings are almost entirely **structure and hygiene**. The dominant one is ① — a 2,440-line function holding 21 closures, which is untestable in pieces and blocks meaningful review of the code inside it. Everything else is smaller: duplicated constraint helpers that have already drifted (②), a triplicated utility (③), signature erasure at the main call boundary (④), and four low-severity hygiene items (⑤–⑧) that all point the same direction — the module has been extended in place for a while without consolidation.
 
-1. **Decompose the 2,440-line function**, using the existing module-level helpers as the seams.
-2. **Write fixture tests for the hold-state machine** — both because it's the least-verified part of the system, and because decomposition is much safer with those tests already in place.
-
-Consolidating the duplicated constraint helpers (finding 2) is a good third, and gets easier once the first is done.
-
----
-
-## Files reviewed
-
-- [x] `scheduler.py::generate_periods` — full; window construction and look-ahead check
-- [x] `engine.py::_apply_turnover_and_cost` (L473–598) — full
-- [x] `engine.py::_assemble_period_result` (L601–644) — full
-- [x] `engine.py::_apply_turnover_penalty` (L966) — full, compared against `risk.py`
-- [x] `engine.py` — loop structure, pipeline delegation (`:4063`), return realisation (`:4326-4352`)
-- [x] `loaders.py`, `replacer.py` — scan level, no concerns
-- [ ] `_run_threshold_hold_multi_periods` hold-state machine — **mapped, not branch-verified** (see above)
+Order I'd tackle them: ① first (the seams already exist, so this is refactor-not-redesign), then ② while the constraint call sites are fresh, then the rest opportunistically. ⑦ is worth doing sooner than its severity suggests, since config-key precedence bugs are silent.
